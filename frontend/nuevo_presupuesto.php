@@ -1,0 +1,289 @@
+<?php
+require_once __DIR__ . '/../api/auth.php';
+$id_usuario_activo = obtenerUsuarioAutenticado();
+if ($id_usuario_activo === null) {
+    header('Location: login.php');
+    exit;
+}
+
+require_once __DIR__ . '/../api/conexion.php';
+require_once __DIR__ . '/../api/models/Presupuesto.php';
+
+$error = '';
+$idPresupuesto = null;
+$presupuesto_seleccionado = null;
+$idPresupuestoEntrada = $_SERVER['REQUEST_METHOD'] === 'POST'
+    ? ($_POST['id_presupuesto'] ?? '')
+    : ($_GET['id'] ?? '');
+
+if ($idPresupuestoEntrada !== '') {
+    $idPresupuesto = filter_var(
+        $idPresupuestoEntrada,
+        FILTER_VALIDATE_INT,
+        ['options' => ['min_range' => 1]]
+    );
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $idCliente = filter_var($_POST['id_cliente'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+    $idsTrabajo = $_POST['trabajo_id'] ?? [];
+    $cantidades = $_POST['cantidad'] ?? [];
+    $items = [];
+
+    if ($idCliente !== false && is_array($idsTrabajo) && is_array($cantidades)) {
+        foreach ($idsTrabajo as $indice => $idTrabajo) {
+            $idTrabajo = filter_var($idTrabajo, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            $cantidad = filter_var($cantidades[$indice] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            if ($idTrabajo !== false && $cantidad !== false) {
+                $items[] = ['id_trabajo' => $idTrabajo, 'cantidad' => $cantidad];
+            }
+        }
+    }
+
+    try {
+        if ($idPresupuestoEntrada !== '' && $idPresupuesto === false) {
+            throw new InvalidArgumentException('El identificador del presupuesto no es válido.');
+        }
+        if ($idCliente === false || !$items) {
+            throw new InvalidArgumentException('Seleccioná un cliente y al menos un trabajo válido.');
+        }
+        (new Presupuesto($conexion))->guardar($id_usuario_activo, $idCliente, $items, $idPresupuesto ?: null);
+        header('Location: presupuestos.php?' . ($idPresupuesto ? 'actualizado=1' : 'creado=1'));
+        exit;
+    } catch (InvalidArgumentException $exception) {
+        $error = $exception->getMessage();
+    } catch (Throwable $exception) {
+        error_log('Error al guardar presupuesto: ' . $exception->getMessage());
+        $error = 'No se pudo guardar el presupuesto. Intentá nuevamente.';
+    }
+}
+
+if ($idPresupuesto !== null && $idPresupuesto !== false) {
+    $presupuesto_seleccionado = (new Presupuesto($conexion))->obtenerPorId(
+        $id_usuario_activo,
+        $idPresupuesto
+    );
+    if ($presupuesto_seleccionado === null) {
+        http_response_code(404);
+        $error = 'No se encontró el presupuesto solicitado.';
+    }
+} elseif ($idPresupuesto === false && $_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(400);
+    exit('El identificador del presupuesto no es válido.');
+}
+
+$stmt_clientes = $conexion->prepare(
+    'SELECT id, nombre, apellido, telefono, email FROM cliente WHERE id_usuario = ? ORDER BY apellido, nombre'
+);
+$stmt_clientes->execute([$id_usuario_activo]);
+$clientes = $stmt_clientes->fetchAll(PDO::FETCH_ASSOC);
+
+$stmt_trabajos = $conexion->prepare(
+    'SELECT t.id, t.nombre, t.id_categoria, t.precio
+     FROM trabajo t
+     INNER JOIN categoria c ON t.id_categoria = c.id
+     WHERE t.id_usuario = ?
+     ORDER BY c.descripcion, t.nombre'
+);
+$stmt_trabajos->execute([$id_usuario_activo]);
+$trabajos_catalogo = $stmt_trabajos->fetchAll(PDO::FETCH_ASSOC);
+
+$stmt_categorias = $conexion->prepare(
+    'SELECT id, descripcion FROM categoria ORDER BY descripcion'
+);
+$stmt_categorias->execute();
+$categorias = $stmt_categorias->fetchAll(PDO::FETCH_ASSOC);
+
+$stmt_estados = $conexion->query('SELECT id, descripcion FROM estado ORDER BY id');
+$estados = $stmt_estados->fetchAll(PDO::FETCH_ASSOC);
+$idEstadoAprobado = null;
+$idEstadoRechazado = null;
+if ($presupuesto_seleccionado) {
+    foreach ($estados as $estado) {
+        $descripcionEstado = mb_strtolower($estado['descripcion']);
+        if ($descripcionEstado === 'aprobado') {
+            $idEstadoAprobado = (int)$estado['id'];
+        } elseif ($descripcionEstado === 'rechazado') {
+            $idEstadoRechazado = (int)$estado['id'];
+        }
+    }
+}
+
+$filas_trabajo = $presupuesto_seleccionado['items'] ?? [null];
+?>
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nuevo presupuesto - Presupuestador</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="css/estilos.css">
+</head>
+<body>
+
+  <div class="app-container">
+    <aside class="sidebar">
+      <div class="brand">
+        <i class="fa-regular fa-lightbulb"></i>
+        <span>Presupuestador</span>
+      </div>
+      <nav>
+        <ul class="nav-list">
+          <li class="nav-item"><a href="index.php"><i class="fa-solid fa-house"></i> Inicio</a></li>
+          <li class="nav-item active"><a href="nuevo_presupuesto.php"><i class="fa-solid fa-file-lines"></i> Presupuestos</a></li>
+          <li class="nav-item"><a href="clientes.php"><i class="fa-solid fa-users"></i> Clientes</a></li>
+          <li class="nav-item"><a href="precios.php"><i class="fa-solid fa-tags"></i> Mis precios</a></li>
+          <li class="nav-item"><a href="usuarios.php"><i class="fa-solid fa-gear"></i> Configuración</a></li>
+        </ul>
+      </nav>
+    </aside>
+
+    <main class="main-content">
+      <section class="view-screen active">
+        
+        <header class="page-header">
+          <div class="page-title">
+            <h1><?php echo $presupuesto_seleccionado ? 'Editar presupuesto' : 'Nuevo presupuesto'; ?></h1>
+            <p><?php echo $presupuesto_seleccionado ? 'Modificá el cliente o los trabajos del presupuesto.' : 'Elegí un cliente y agregá los trabajos para calcular el presupuesto.'; ?></p>
+            <?php if ($presupuesto_seleccionado): ?>
+              <p id="estado-presupuesto">Estado: <strong><?php echo htmlspecialchars($presupuesto_seleccionado['estado'], ENT_QUOTES, 'UTF-8'); ?></strong></p>
+            <?php endif; ?>
+          </div>
+          <?php if ($presupuesto_seleccionado && in_array(mb_strtolower($presupuesto_seleccionado['estado']), ['borrador', 'pendiente'], true) && $idEstadoAprobado !== null && $idEstadoRechazado !== null): ?>
+            <div class="header-actions" id="acciones-estado-presupuesto">
+              <button type="button" class="btn btn-primary btn-cambiar-estado" data-id-estado="<?php echo $idEstadoAprobado; ?>">Aprobar presupuesto</button>
+              <button type="button" class="btn btn-outline btn-cambiar-estado" data-id-estado="<?php echo $idEstadoRechazado; ?>">Rechazar presupuesto</button>
+            </div>
+          <?php endif; ?>
+        </header>
+
+        <?php if ($error !== ''): ?>
+          <p class="auth-error" role="alert"><?php echo htmlspecialchars($error, ENT_QUOTES, 'UTF-8'); ?></p>
+        <?php endif; ?>
+
+        <form action="nuevo_presupuesto.php" method="POST">
+          <input type="hidden" name="id_presupuesto" value="<?php echo $idPresupuestoEntrada !== '' ? htmlspecialchars((string)$idPresupuestoEntrada, ENT_QUOTES, 'UTF-8') : ''; ?>">
+          <!-- Bloque 1: Seleccionar Cliente de la Base de Datos -->
+          <div class="card form-section">
+            <div class="section-header-flex">
+              <h3>Datos del Cliente</h3>
+              <a href="nuevo_cliente.php" class="btn btn-outline">+ Crear nuevo cliente</a>
+            </div>
+
+            <div class="form-grid-3">
+              <div class="form-group" style="grid-column: span 3;">
+                <label for="id_cliente">Seleccionar Cliente Existente *</label>
+                <select name="id_cliente" id="id_cliente" class="input-table" required>
+                  <option value="" disabled <?php echo $presupuesto_seleccionado ? '' : 'selected'; ?>>Seleccione un cliente...</option>
+                  <?php foreach ($clientes as $c): ?>
+                    <option value="<?php echo (int)$c['id']; ?>"
+                            data-telefono="<?php echo htmlspecialchars((string)($c['telefono'] ?? ''), ENT_QUOTES, 'UTF-8'); ?>"
+                            data-email="<?php echo htmlspecialchars((string)($c['email'] ?? ''), ENT_QUOTES, 'UTF-8'); ?>"
+                            <?php echo $presupuesto_seleccionado && (int)$presupuesto_seleccionado['id_cliente'] === (int)$c['id'] ? 'selected' : ''; ?>>
+                      <?php echo htmlspecialchars($c['nombre'] . ' ' . $c['apellido'], ENT_QUOTES, 'UTF-8'); ?>
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <!-- Bloque 2: Trabajos a Realizar -->
+          <div class="card form-section">
+            <div class="section-header-flex">
+              <h3>Trabajos a realizar</h3>
+              <button type="button" id="btn-add-trabajo" class="btn btn-primary">+ Añadir trabajo</button>
+            </div>
+
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Categoria</th>
+                    <th>Trabajo del Catálogo</th>
+                    <th>Precio Unit.</th>
+                    <th>Cant.</th>
+                    <th>Subtotal</th>
+                    <th class="actions-cell"></th>
+                  </tr>
+                </thead>
+                <tbody id="tabla-trabajos">
+                  <?php foreach ($filas_trabajo as $fila_trabajo): ?>
+                  <tr>
+                    <td>
+                      <select name="categoria[]" class="input-table select-categoria" required>
+                        <option value="" disabled <?php echo $fila_trabajo ? '' : 'selected'; ?>>Seleccionar categoría...</option>
+                        <?php foreach ($categorias as $categoria): ?>
+                          <option value="<?php echo (int)$categoria['id']; ?>" <?php echo $fila_trabajo && (int)$fila_trabajo['id_categoria'] === (int)$categoria['id'] ? 'selected' : ''; ?>><?php echo htmlspecialchars($categoria['descripcion'], ENT_QUOTES, 'UTF-8'); ?></option>
+                        <?php endforeach; ?>
+                      </select>
+                    </td>
+                    <td>
+                      <select name="trabajo_id[]" class="input-table select-trabajo" required <?php echo $fila_trabajo ? '' : 'disabled'; ?>>
+                        <option value="" disabled <?php echo $fila_trabajo ? '' : 'selected'; ?>>Seleccionar trabajo...</option>
+                        <?php foreach ($trabajos_catalogo as $trabajo): ?>
+                          <option value="<?php echo (int)$trabajo['id']; ?>"
+                                  data-categoria="<?php echo (int)$trabajo['id_categoria']; ?>"
+                                  data-precio="<?php echo htmlspecialchars((string)$trabajo['precio'], ENT_QUOTES, 'UTF-8'); ?>"
+                                  <?php echo $fila_trabajo && (int)$fila_trabajo['id_trabajo'] === (int)$trabajo['id'] ? 'selected' : ''; ?>>
+                            <?php echo htmlspecialchars($trabajo['nombre'], ENT_QUOTES, 'UTF-8'); ?>
+                          </option>
+                        <?php endforeach; ?>
+                      </select>
+                    </td>
+                    <td><input type="number" step="0.01" name="precio_unitario[]" class="input-table input-precio" placeholder="$ 0,00" value="<?php echo $fila_trabajo ? htmlspecialchars((string)$fila_trabajo['precio_unitario'], ENT_QUOTES, 'UTF-8') : ''; ?>" readonly></td>
+                    <td><input type="number" name="cantidad[]" class="input-table input-cantidad" value="<?php echo $fila_trabajo ? (int)$fila_trabajo['cantidad'] : 1; ?>" min="1" placeholder="0" required></td>
+                    <td class="text-bold celda-subtotal">$0.00</td>
+                    <td class="actions-cell">
+                      <button type="button" class="action-btn text-danger btn-eliminar-fila"><i class="fa-regular fa-trash-can"></i></button>
+                    </td>
+                  </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Bloque de Guardado -->
+          <div class="card form-section">
+            <div class="quote-summary-container">
+              <div class="notes-block">
+                <h2 style="font-size: 1.25rem;" id="total-presupuesto">Total $0,00</h2>
+                <input type="hidden" name="monto_total_oculto" id="monto_total_oculto" value="0">
+              </div>
+              <div class="header-actions">
+                <button type="button" class="btn btn-outline" id="btn-descargar-pdf">Descargar PDF</button>
+                <button type="submit" class="btn btn-primary" id="btn-finalizar-presupuesto"><?php echo $presupuesto_seleccionado ? 'Guardar cambios' : 'Guardar Presupuesto'; ?></button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Bloque 5: Envios por mail y Whatsapp -->
+        <div class="card form-section">
+          <h3>Envios por mail y Whatsapp</h3>
+          <div class="quote-summary-container">
+            <div class="notes-block">
+            </div>
+            <div class="header-actions">
+              <button type="button" class="btn btn-primary" id="btn-enviar-email">Enviar por Email</button>
+              <button type="button" class="btn btn-primary" id="btn-enviar-whatsapp">Enviar por WhatsApp</button>
+            </div>
+          </div>
+        </div>
+        </form>
+
+      </section>
+    </main>
+  </div>
+
+  <!-- Puedes conservar tu lógica de JS para calcular subtotales dinámicamente -->
+  <script src="js/nuevo_presupuesto.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.28/jspdf.plugin.autotable.min.js"></script>
+  <script src="js/generar_pdf.js"></script>
+</body>
+</html>
